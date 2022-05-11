@@ -4,59 +4,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
+
 
 def weights_init(module):
     if isinstance(module, nn.Linear):
         nn.init.kaiming_uniform_(module.weight)
         module.bias.data.fill_(0.01)
 
+
 class DynamicsModel(nn.Module):
-    def __init__(self, env, mu_s, mu_a, std_s, std_a, std_delta, args):
+    def __init__(self, env, args):
         super(DynamicsModel, self).__init__()
         obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
-        self.model = MLP(input_dim=obs_dim + act_dim, output_dim=args.dynamics_hidden_dim[-1], hidden_dim=args.dynamics_hidden_dim)
-        self.mean_layer = nn.Linear(args.dynamics_hidden_dim[-1], obs_dim)
-        self.log_std_layer = nn.Linear(args.dynamics_hidden_dim[-1], obs_dim)
-        
-        self.mu_s = mu_s
-        self.mu_a = mu_a
-        self.std_s = std_s
-        self.std_a = std_a
-        self.std_delta = std_delta
-
-        self.apply(weights_init)
-
-    def forward(self, state, action):
-        s_mlp = (state - self.mu_s) / (self.std_s + 1e-7)
-        a_mlp = (action - self.mu_a) / (self.std_a + 1e-7)
-        out = self.model(s_mlp, a_mlp)
-        mean = state + self.std_delta * self.mean_layer(out)
-        log_std = self.log_std_layer(out)
-        log_std = torch.clamp(log_std, -20, 5)
-        return mean, log_std
-
-    def get_next_state(self, state, action):
-        if isinstance(state, np.ndarray):
-            state = torch.tensor(state, dtype=torch.float)
-        if len(state.shape) == 1:
-            state = state.unsqueeze(0)
-        if isinstance(action, np.ndarray):
-            action = torch.tensor(action, dtype=torch.float)
-        if len(action.shape) == 1:
-            action = action.unsqueeze(0)
-        mean, log_std = self.forward(state, action)
-        std = log_std.exp()
-        dist = Normal(mean, std)
-        return dist.rsample()
+        # Output : state + reward
+        self.model = MLP(input_dim=obs_dim + act_dim, output_dim=obs_dim + 1, hidden_dim=args.dynamics_hidden_dim)
+    
+    def forward(self, obs):
+        return self.model(obs)
 
 
 class Actor(nn.Module):
     def __init__(self, env, args):
         super(Actor, self).__init__()
+        self.env = env
         self.obs_dim = env.observation_space.shape[0]
         self.act_dim = env.action_space.shape[0]
-        self.mlp = MLP(input_dim=self.obs_dim, output_dim=args.policy_hidden_dim[-1], hidden_dim=args.policy_hidden_dim, activation_fn=nn.Tanh())
+        self.mlp = MLP(input_dim=self.obs_dim, output_dim=args.policy_hidden_dim[-1], hidden_dim=args.policy_hidden_dim)
         self.mean_layer = nn.Linear(args.policy_hidden_dim[-1], self.act_dim)
         self.log_std_layer = nn.Linear(args.policy_hidden_dim[-1], self.act_dim)
 
@@ -68,7 +43,7 @@ class Actor(nn.Module):
         out = self.mlp(obs)
         mean = self.mean_layer(out)
         log_std = self.log_std_layer(out)
-        log_std = torch.clamp(log_std, -20, 5)
+        log_std = torch.clamp(log_std, min=-2, max=5)
         return mean, log_std
 
     def get_action(self, obs):
@@ -76,6 +51,7 @@ class Actor(nn.Module):
         std = log_std.exp()
         dist = Normal(mean, std)
         action = dist.sample()
+        action = torch.clamp(action, torch.tensor(self.env.action_space.low), torch.tensor(self.env.action_space.high))
         log_prob = dist.log_prob(action)
         log_prob = log_prob.sum(1, keepdim=True)
         return action, log_prob
@@ -83,6 +59,7 @@ class Actor(nn.Module):
     def evaluate_action(self, obs, action):
         mean, log_std = self.forward(obs)
         std = log_std.exp()
+        print(obs, action)
         dist = Normal(mean, std)
         action = action.view(-1, self.act_dim)
         log_prob = dist.log_prob(action)

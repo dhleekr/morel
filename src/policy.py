@@ -1,8 +1,12 @@
+from tqdm import tqdm
+import collections
 import numpy as np
 import torch
 import torch.nn.functional as F
-from .networks import Actor, Critic
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
+from torch.utils.tensorboard import SummaryWriter
+from src.networks import Actor, Critic
 
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu") 
@@ -16,11 +20,13 @@ class PPO:
         self.obs_dim = env.observation_space.shape[0]
         self.act_dim = env.action_space.shape[0]
 
-        self.actor = Actor(env, args)
-        self.critic = Critic(env, args)
+        self.actor = Actor(env, args).to(device)
+        self.critic = Critic(env, args).to(device)
 
         self.actor_optimizer = Adam(self.actor.parameters(), lr=self.args.policy_lr)
         self.critic_optimizer = Adam(self.critic.parameters(), lr=self.args.value_lr)
+
+        self.BC_dataloader = DataLoader(BC_Dataset(env), batch_size=args.batch_size, shuffle=True)
 
         self.logger = dict(
             epoch=[],
@@ -33,68 +39,75 @@ class PPO:
             ratios=[],
             surr1=[],
             surr2=[],
-            reward=[],
             value=[],
-            rtgs=[],
+            returns=[],
             log_prob=[],
         )
 
+        self.writer = SummaryWriter(f"./results/{self.args.env}")
+
     def train(self):
+        print('\n')
         print('#'*50)
-        print('Policy training starts...')
+        print('Policy Training Starts...')
         print('#'*50)
         print('\n')
 
-        total_timesteps = 0
+        self.total_timesteps = 0
         for epoch in range(self.args.epochs):
-            batch_states, batch_actions, batch_log_probs, batch_rtgs = self.rollout()
-            print(batch_states.shape)
-            with torch.no_grad():
-                values = self.critic(batch_states).view(-1)
-            advantage = batch_rtgs - values
-            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-7)
+            if self.args.bc_epochs > epoch:
+                self.behavior_cloning()
+            else:
+                batch_states, batch_actions, batch_returns, batch_log_probs = self.rollout()
+                
+                self.logger['returns'].append(batch_returns.mean())
 
-            self.logger['advantage'].append(advantage.mean())
-            self.logger['rtgs'].append(batch_rtgs.mean())
+                for _ in tqdm(range(self.args.updates)):
+                    self.total_timesteps += 1
+                    values = self.critic(batch_states).squeeze()
+                    log_probs, dist_entropy = self.actor.evaluate_action(batch_states, batch_actions)
+                    log_probs = log_probs.squeeze()
 
-            for _ in range(self.args.updates):
-                total_timesteps += 1
+                    advantage = batch_returns - values
+                    # advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-7)
 
-                values = self.critic(batch_states).view(-1)
-                log_probs, dist_entropy = self.actor.evaluate_action(batch_states, batch_actions)
-                ratios = torch.exp(log_probs - batch_log_probs).view(-1)
+                    ratios = torch.exp(log_probs - batch_log_probs)
 
-                surr1 = ratios * advantage
-                surr2 = torch.clamp(ratios, 1 - self.args.clip, 1 + self.args.clip) * advantage
+                    surr1 = ratios * advantage
+                    surr2 = torch.clamp(ratios, 1 - self.args.clip, 1 + self.args.clip) * advantage
+                    
+                    actor_loss = -torch.min(surr1, surr2).mean()
+                    critic_loss = F.mse_loss(values, batch_returns)
+                    entropy_loss = -torch.mean(dist_entropy)     
 
-                actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = F.mse_loss(values, batch_rtgs)
-                entropy_loss = -torch.mean(dist_entropy)
+                    total_loss = critic_loss * self.args.value_loss_coef + actor_loss + self.args.entropy_coef * entropy_loss
 
-                total_loss = critic_loss * self.args.value_loss_coef + actor_loss + self.args.entropy_coef * entropy_loss
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
 
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
+                    total_loss.backward()
 
-                total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
 
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
+                    self.actor_optimizer.step()
+                    self.critic_optimizer.step()
 
-                # logging 
-                self.logger['total_loss'].append(total_loss)
-                self.logger['actor_loss'].append(actor_loss)
-                self.logger['critic_loss'].append(critic_loss)
-                self.logger['entropy_loss'].append(entropy_loss)
-                self.logger['ratios'].append(ratios.mean())
-                self.logger['surr1'].append(surr1.mean())
-                self.logger['surr2'].append(surr2.mean())
-                self.logger['value'].append(values.mean())
-                self.logger['log_prob'].append(log_probs.mean())
-            
+                    # logging 
+                    self.logger['total_loss'].append(total_loss)
+                    self.logger['actor_loss'].append(actor_loss)
+                    self.logger['critic_loss'].append(critic_loss)
+                    self.logger['entropy_loss'].append(entropy_loss)
+                    self.logger['advantage'].append(advantage.mean())
+                    self.logger['ratios'].append(ratios.mean())
+                    self.logger['surr1'].append(surr1.mean())
+                    self.logger['surr2'].append(surr2.mean())
+                    self.logger['value'].append(values.mean())
+                    self.logger['log_prob'].append(log_probs.mean())
+
             if epoch % self.args.logging_freq == 0:
                 self.logger['epoch'].append(epoch + 1)
-                self.logger['total_timesteps'].append(total_timesteps)
+                self.logger['total_timesteps'].append(self.total_timesteps)
                 self.logging()
             
             if epoch % self.args.eval_freq == 0:
@@ -104,11 +117,11 @@ class PPO:
                 torch.save(self.actor.state_dict(), f'./models/actor_{self.args.env}.pt')
                 print('Model saved!!!!!!!!!!!!')
 
-            for k in self.logger.keys():
-                self.logger[k] = []
+        self.writer.flush()
+        self.writer.close()
 
         print('#'*50)
-        print('Policy training finished...')
+        print('Policy Training Finished...')
         print('#'*50)
         print('\n')     
 
@@ -117,63 +130,90 @@ class PPO:
         batch_actions = []
         batch_log_probs = []
         batch_rewards = []
-        batch_rtgs = []
+        batch_dones = []
+        batch_values = []
 
-        for episode in range(self.args.num_traj):
-            state = self.env.reset()
+        with torch.no_grad():
             t = 0
+            state = self.dynamics.reset()
             done = False
-            episode_reward = []
-
-            while True:
-                with torch.no_grad():
-                    action, log_prob = self.actor.get_action(state)
-                    action, log_prob = action.cpu().numpy(), log_prob.cpu().numpy()
-                    next_state, reward, done = self.dynamics.step(state, action)
+            for _ in range(self.args.num_traj):     
+                action, log_prob = self.actor.get_action(state)
+                value = self.critic(state)
+                action = torch.squeeze(action)
+                log_prob = torch.squeeze(log_prob)
+                value = torch.squeeze(value)
 
                 batch_states.append(state)
                 batch_actions.append(action)
                 batch_log_probs.append(log_prob)
-                episode_reward.append(reward)
+                batch_values.append(value)
+
+                next_state, reward, done, _ = self.dynamics.step(state, action)
+
+                batch_rewards.append(reward)
 
                 t += 1
-
                 if t >= self.args.max_episode_len:
                     done = True
 
-                if done:
-                    break            
+                batch_dones.append(done)
 
+                if done:
+                    state = self.dynamics.reset()
+                    done = False
+                    t = 0
+                
                 state = next_state
 
-            batch_rewards.append(episode_reward)
+            batch_states = torch.stack(batch_states)
+            batch_actions = torch.stack(batch_actions)
+            batch_log_probs = torch.stack(batch_log_probs)
+            batch_rewards = torch.stack(batch_rewards)
+            batch_values = torch.stack(batch_values)
+            batch_dones = np.asarray(batch_dones, dtype=np.bool_)
 
-        self.logger['reward'].append(sum(sum(row) / self.args.max_episode_len for row in batch_rewards))
+            print(collections.Counter(batch_dones))
 
-        batch_states = torch.tensor(batch_states, dtype=torch.float)
-        batch_actions = torch.tensor(batch_actions, dtype=torch.float).view(-1, self.act_dim)
-        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float).view(-1, 1)
-        with torch.no_grad():
-            batch_rtgs = self.compute_rtgs(batch_rewards)
-        return batch_states, batch_actions, batch_log_probs, batch_rtgs
+            last_value = self.critic(state)
 
-    def compute_rtgs(self, batch_rewards):
-        batch_rtgs = []
+            batch_advantages = torch.zeros_like(batch_rewards).float().to(device)
+            last_gae_lam = torch.Tensor([0.0]).float().to(device)
 
-        for ep_rews in reversed(batch_rewards):
-            discounted_reward = 0
+            for t in reversed(range(self.args.num_traj)):
+                if t == self.args.num_traj - 1:
+                    next_non_terminal = 1.0 - done
+                    next_values = last_value
+                else:
+                    next_non_terminal = 1.0 - batch_dones[t + 1]
+                    next_values = batch_values[t + 1]
 
-            for rew in reversed(ep_rews):
-                discounted_reward = rew + discounted_reward * self.args.gamma
-                batch_rtgs.insert(0, discounted_reward)
-        batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float)
-        batch_rtgs = (batch_rtgs - batch_rtgs.mean()) / (batch_rtgs.std() + 1e-7)
-        return batch_rtgs
+                delta = batch_rewards[t] + self.args.gamma * next_values * next_non_terminal - batch_values[t]
+                batch_advantages[t] = last_gae_lam = delta + self.args.gamma * self.args.gae_lambda * next_non_terminal * last_gae_lam
+            
+            batch_returns = batch_advantages + batch_values
 
+        return batch_states, batch_actions, batch_returns, batch_log_probs
+
+    def behavior_cloning(self):
+        for i, batch in enumerate(tqdm(self.BC_dataloader)):
+            self.total_timesteps += 1
+            feed, target = batch
+            log_prob, _ = self.actor.evaluate_action(feed, target)
+            actor_loss = -log_prob.sum()
+
+            self.actor_optimizer.zero_grad()
+                    
+            actor_loss.backward()
+
+            self.actor_optimizer.step()
+
+            self.logger['actor_loss'].append(actor_loss)
+ 
     def evaluation(self):
-        print('\n')
         print('#'*50)
-        print('Start Evaluation!!!!!!!!!!!')
+        print('Evaluation!!!!!!!!!!!')
+        self.actor = self.actor.to("cpu")
 
         with torch.no_grad():
             avg_episode_reward = 0
@@ -184,7 +224,7 @@ class PPO:
                 done = False
                 episode_steps = 0
                 episode_reward = 0
-                for _ in range(self.args.max_episode_len):
+                while True:
                     if self.args.render:
                         self.env.render()
                     action, _ = self.actor.get_action(state)
@@ -207,7 +247,11 @@ class PPO:
             print(f"Average epdisode reward : {avg_episode_reward}")
             print(f"Average epdisode steps : {avg_episode_steps}")
             print('#'*50)
-            print('\n\n\n')
+            print('\n\n')
+
+            self.writer.add_scalar("Average return", avg_episode_reward, self.total_timesteps)
+            self.actor = self.actor.to(device)
+            
 
     def logging(self):
         epoch = self.logger['epoch'][0]
@@ -221,10 +265,10 @@ class PPO:
         surr1 = sum(self.logger['surr1']) / (len(self.logger['surr1']) + 1e-7)
         surr2 = sum(self.logger['surr2']) / (len(self.logger['surr2']) + 1e-7)
         value = sum(self.logger['value']) / (len(self.logger['value']) + 1e-7)
-        reward = sum(self.logger['reward']) / (len(self.logger['reward']) + 1e-7)
-        rtgs = sum(self.logger['rtgs']) / (len(self.logger['rtgs']) + 1e-7)
+        returns = sum(self.logger['returns']) / (len(self.logger['returns']) + 1e-7)
         log_prob = sum(self.logger['log_prob']) / (len(self.logger['log_prob']) + 1e-7)
 
+        print('\n')     
         print('#'*50)
         print(f'epoch\t\t\t|\t{epoch}')
         print(f'total_timesteps\t\t|\t{total_timesteps}')
@@ -237,8 +281,55 @@ class PPO:
         print(f'surr1\t\t\t|\t{surr1}')
         print(f'surr2\t\t\t|\t{surr2}')
         print(f'value\t\t\t|\t{value}')
-        print(f'reward\t\t\t|\t{reward}')
-        print(f'rtgs\t\t\t|\t{rtgs}')
+        print(f'returns\t\t\t|\t{returns}')
         print(f'log_prob\t\t|\t{log_prob}')
         print('#'*50)
         print('\n')
+
+        for k in self.logger.keys():
+            self.logger[k] = []
+
+    def test(self):
+        import random     
+        self.actor.load_state_dict(torch.load(f"./models/actor_{self.args.env}.pt", map_location=device))
+
+        for _ in range(15):
+            done = False
+            self.env.seed(random.randint(0, 1000))
+            state = self.env.reset()
+            episode_steps = 0
+            episode_reward = 0
+
+            while True:
+                self.env.render()
+                action, _ = self.actor.get_action(state)
+                action = action.cpu().numpy().squeeze()
+                # action = self.env.action_space.sample()
+                next_state, reward, done, _ = self.env.step(action)
+                episode_reward += reward
+                episode_steps += 1
+                state = next_state
+                    
+                if done:
+                    break
+
+            print('#'*50)
+            print(f"Epdisode steps : {episode_steps}")
+            print(f"Epdisode reward : {episode_reward}")
+            print('#'*50)
+            print('\n')
+
+
+class BC_Dataset(Dataset):
+    def __init__(self, env):
+        dataset = env.get_dataset()
+        self.observation = dataset["observations"]
+        self.action = dataset["actions"]
+
+    def __getitem__(self, idx):
+        feed = torch.FloatTensor(self.observation[idx]).to(device)
+        target = torch.FloatTensor(self.action[idx]).to(device)
+        return feed, target
+
+    def __len__(self):
+        return len(self.observation)
